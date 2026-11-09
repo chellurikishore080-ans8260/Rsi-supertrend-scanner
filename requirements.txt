@@ -1,4 +1,0 @@
-streamlit>=1.37
-requests
-pandas
-numpy
