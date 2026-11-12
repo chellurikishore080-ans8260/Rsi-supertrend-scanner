@@ -1,5 +1,5 @@
 """Kishore RSI Scanner - RSI Long + RSI Short only (Binance Spot, Streamlit).
-Fixed coin list (Kishore's selected coins). Backtest = 10000 candles per coin per timeframe,
+Coins: LINK + top-by-volume, screenshot coins removed. Backtest = 10000 candles per coin per timeframe,
 one fast combined run (progress bar) with a coin filter on the trade list.
 Supertrend is used ONLY for the RSI-Long exit (RSI >= 58 accepted when a bearish
 Supertrend line rejects price). No ST Long / ST Short trades."""
@@ -18,9 +18,12 @@ RSI_LEN, ST_LEN, ST_MULT = 14, 10, 3.0
 TFS = ["5m", "15m", "30m", "1h", "4h"]
 BT_CANDLES = 10000          # candles per coin per timeframe in the backtest
 LIVE_AGE = 4                # live scanner: show signals up to this many candles old
-# ONLY LINK (add more coins here if needed)
-COINS = ["LINK"]
-SYMS = [c + "USDT" for c in COINS]
+# Universe = top USDT coins by volume (as before), minus the coins from Kishore's screenshots.
+# LINK is always kept.
+KEEP = ["LINK"]
+EXCLUDE = {"GRAM", "ARB", "TAO", "BNB", "ERA", "UNI", "AVAX", "NEAR", "SOL", "SUI", "CRCLB", "ENA",
+           "INJ", "INIT", "DOGE", "NVDAB", "SPCXB", "ONE", "U", "RLUSD", "XRP", "BTC"}
+SKIP = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "EUR", "AEUR", "USD1", "USDE", "XUSD", "BFUSD"}
 HOSTS = ["https://data-api.binance.vision", "https://api.binance.com",
          "https://api1.binance.com", "https://api2.binance.com", "https://api3.binance.com"]
 COLS = ["ot", "open", "high", "low", "close", "vol", "ct"]
@@ -38,6 +41,25 @@ def api(path, params=None):
         except Exception as e:
             last = f"{h} -> {e}"
     raise RuntimeError(last)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def top_symbols(n):
+    """LINK + top-n volume USDT coins, excluding the screenshot coins."""
+    df = pd.DataFrame(api("/api/v3/ticker/24hr"))
+    df = df[df.symbol.str.endswith("USDT")]
+    base = df.symbol.str[:-4]
+    df = df[~base.isin(SKIP | EXCLUDE | set(KEEP))].copy()
+    df["q"] = df.quoteVolume.astype(float)
+    return [k + "USDT" for k in KEEP] + df.sort_values("q", ascending=False).symbol.head(n).tolist()
+
+
+def get_syms(n):
+    try:
+        return top_symbols(n)
+    except Exception as e:
+        st.error(f"Coin list load avvaledu: {e}")
+        return [k + "USDT" for k in KEEP]
 
 
 @st.cache_resource
@@ -212,15 +234,7 @@ def table(v, by):
 
 
 def coin_table(v):
-    """One row for EVERY coin in COINS (0 trades if none)."""
-    cols = ["Trades", "Win", "Fail", "Win %", "Real Win %", "RSI ✓ but Loss",
-            "Net PnL ₹", "Total Loss ₹", "Worst Loss %"]
-    t = table(v, ["Coin"]) if not v.empty else pd.DataFrame(columns=["Coin"] + cols)
-    t = t.set_index("Coin").reindex(COINS)
-    t[cols] = t[cols].fillna(0)
-    for c in ["Trades", "Win", "Fail", "RSI ✓ but Loss"]:
-        t[c] = t[c].astype(int)
-    return t.reset_index()
+    return table(v, ["Coin"])
 
 
 def add_loss_rank(v):
@@ -277,11 +291,12 @@ FMT = {"Entry": "{:.6g}", "Exit": "{:.6g}", "RSI In": "{:.1f}", "RSI Out": "{:.1
 
 def live_tab():
     tfs = st.multiselect("Timeframes", TFS, default=["5m", "15m", "1h"], key="ltf")
-    st.caption("Coins: " + ", ".join(COINS))
+    n = st.slider("Coins (top by volume)", 10, 100, 40, 5, key="ln")
+    st.caption("LINK + top volume coins (screenshot coins removed).")
 
     @st.fragment(run_every=60)
     def body():
-        pairs = [(s, t) for s in SYMS for t in tfs]
+        pairs = [(s, t) for s in get_syms(n) for t in tfs]
         data = load_many(pairs, 300, 50)
         bad = sum(v is None for v in data.values())
         res = scan_live(data, LIVE_AGE)
@@ -299,14 +314,16 @@ def live_tab():
 def backtest_tab():
     c1, c2 = st.columns(2)
     candles = c1.number_input("Candles per coin per TF", 1000, 20000, BT_CANDLES, 1000)
-    tfs = c2.multiselect("Timeframes", TFS, default=TFS, key="btf")
+    n = c2.slider("Coins (top by volume)", 10, 100, 30, 5, key="bn")
+    tfs = st.multiselect("Timeframes", TFS, default=TFS, key="btf")
     c3, c4 = st.columns(2)
     cap = c3.number_input("Capital ₹", 10000, 10_000_000, 100000, 10000)
     per = c4.slider("Capital per trade %", 10, 100, 50, 10)
     strict = st.checkbox("Strict: SUCCESS ki RSI target + price kuda profit lo undali", value=False)
 
     if st.button("▶ Run backtest", type="primary"):
-        pairs = [(s, t) for s in SYMS for t in tfs]
+        syms = get_syms(n)
+        pairs = [(s, t) for s in syms for t in tfs]
         bar = st.progress(0.0, text=f"Binance nundi {len(pairs)} series techukuntunnanu...")
         data = load_many(pairs, int(candles), 600,
                          lambda x: bar.progress(x, text=f"Data load {x * 100:.0f}%"))
@@ -388,7 +405,7 @@ def backtest_tab():
     st.dataframe(tt.sort_values("o").drop(columns="o"), hide_index=True)
 
     st.subheader("Trades (time, price, entry, exit)")
-    cf = st.selectbox("Coin", ["All"] + COINS)
+    cf = st.selectbox("Coin", ["All"] + sorted(tr.Coin.unique()))
     go = vo[vo.Result == "OPEN"]
     d = pd.concat([v, go])
     if cf != "All":
@@ -417,7 +434,7 @@ def main():
             f"- **RSI Short** — RSI ≥ {SHORT_IN} → sell. FAIL: RSI ≥ {SHORT_SL}. SUCCESS: RSI ≤ {SHORT_TP}.\n"
             "- **Win %** = RSI rule SUCCESS. **Real Win %** = price PnL > 0 (RSI target hit ayina price loss lo undochu).\n"
             "- RSI trades have **no price stop** — the RSI level is the stop, so a FAIL can be a big % loss.\n"
-            f"- Coins: {', '.join(COINS)}")
+            "- Coins: LINK + top volume Binance USDT coins (screenshot coins removed, LINK kept)")
     t1, t2 = st.tabs(["🔴 Live scanner (auto)", "📊 Backtest"])
     with t1:
         live_tab()
