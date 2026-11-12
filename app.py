@@ -18,9 +18,8 @@ RSI_LEN, ST_LEN, ST_MULT = 14, 10, 3.0
 TFS = ["5m", "15m", "30m", "1h", "4h"]
 BT_CANDLES = 10000          # candles per coin per timeframe in the backtest
 LIVE_AGE = 4                # live scanner: show signals up to this many candles old
-# ONLY these coins (U, RLUSD, XRP, BTC, ONE removed)
-COINS = ["GRAM", "ARB", "TAO", "BNB", "ERA", "UNI", "AVAX", "NEAR", "LINK", "SOL",
-         "SUI", "CRCLB", "ENA", "INJ", "INIT", "DOGE", "NVDAB", "SPCXB"]
+# ONLY LINK (add more coins here if needed)
+COINS = ["LINK"]
 SYMS = [c + "USDT" for c in COINS]
 HOSTS = ["https://data-api.binance.vision", "https://api.binance.com",
          "https://api1.binance.com", "https://api2.binance.com", "https://api3.binance.com"]
