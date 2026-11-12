@@ -1,10 +1,10 @@
 """Kishore RSI Scanner - RSI Long + RSI Short only (Binance Spot, Streamlit).
 Fixed coin list (Kishore's selected coins). Backtest = 10000 candles per coin per timeframe,
-separate backtest block for every coin.
+one fast combined run (progress bar) with a coin filter on the trade list.
 Supertrend is used ONLY for the RSI-Long exit (RSI >= 58 accepted when a bearish
 Supertrend line rejects price). No ST Long / ST Short trades."""
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -90,7 +90,12 @@ def klines(sym, tf, total):
         p = {"symbol": sym, "interval": tf, "limit": lim}
         if end is not None:
             p["endTime"] = end
-        raw = api("/api/v3/klines", p)
+        try:
+            raw = api("/api/v3/klines", p)
+        except Exception:
+            if rows:                      # keep what we already got
+                break
+            raise
         if not raw:
             break
         rows = raw + rows                 # older batch goes in front
@@ -119,26 +124,33 @@ def fetch_kl(sym, tf, limit, store, ttl):
     return df
 
 
-def load_many(pairs, limit, ttl):
+def load_many(pairs, limit, ttl, progress=None):
     store = _store()
-    with ThreadPoolExecutor(8) as ex:
-        res = list(ex.map(lambda p: fetch_kl(p[0], p[1], limit, store, ttl), pairs))
-    return dict(zip(pairs, res))
+    out = {}
+    with ThreadPoolExecutor(16) as ex:
+        futs = {ex.submit(fetch_kl, p[0], p[1], limit, store, ttl): p for p in pairs}
+        for n, f in enumerate(as_completed(futs), 1):
+            out[futs[f]] = f.result()
+            if progress:
+                progress(n / len(pairs))
+    return {p: out[p] for p in pairs}
 
 
 # ---------------- BACKTEST ----------------
-def _trade(sym, tf, side, j, i, res, df):
-    cl, r, ts = df.close.values, df.rsi.values, df.t.dt.strftime("%d-%b-%y %H:%M").values
+def _trade(sym, tf, side, j, i, res, a):
+    cl, r, ts, ct = a["cl"], a["r"], a["ts"], a["ct"]
     e, x = cl[j], cl[i]
     pct = (x / e - 1) * 100 if side == "RSI Long" else (e - x) / e * 100
     return {"Coin": sym.replace("USDT", ""), "TF": tf, "Logic": side,
             "Entry Time": ts[j], "Entry": e, "Exit Time": ts[i], "Exit": x,
             "RSI In": r[j], "RSI Out": r[i], "Candles": i - j, "Result": res,
-            "PnL %": pct, "_ts": df.ct.values[j]}
+            "PnL %": pct, "_ts": ct[j]}
 
 
 def run_bt(df, sym, tf, price_ok=False):
     r, rej, cl = df.rsi.values, df.rej.values, df.close.values
+    a = {"cl": cl, "r": r, "ct": df.ct.values,
+         "ts": df.t.dt.strftime("%d-%b-%y %H:%M").values}   # format times ONCE per series
     out, pos = [], None
     for i in range(len(df)):
         if np.isnan(r[i]):
@@ -165,10 +177,10 @@ def run_bt(df, sym, tf, price_ok=False):
             if not (cl[i] > cl[j] if side == "RSI Long" else cl[i] < cl[j]):
                 res = None
         if res:
-            out.append(_trade(sym, tf, side, j, i, res, df))
+            out.append(_trade(sym, tf, side, j, i, res, a))
             pos = None
     if pos:
-        out.append(_trade(sym, tf, pos[0], pos[1], len(df) - 1, "OPEN", df))
+        out.append(_trade(sym, tf, pos[0], pos[1], len(df) - 1, "OPEN", a))
     return out
 
 
@@ -296,15 +308,17 @@ def backtest_tab():
 
     if st.button("▶ Run backtest", type="primary"):
         pairs = [(s, t) for s in SYMS for t in tfs]
-        with st.spinner(f"Binance nundi {len(SYMS)} coins x {len(tfs)} TF x {candles} candles techukuntunnanu "
-                        "(konchem time padutundi)..."):
-            data = load_many(pairs, int(candles), 600)
+        bar = st.progress(0.0, text=f"Binance nundi {len(pairs)} series techukuntunnanu...")
+        data = load_many(pairs, int(candles), 600,
+                         lambda x: bar.progress(x, text=f"Data load {x * 100:.0f}%"))
+        bar.progress(1.0, text="Backtest lekkalu chestunnanu...")
         failed = [(s.replace("USDT", ""), t) for (s, t), d in data.items() if d is None]
         counts = {(s.replace("USDT", ""), t): len(d) for (s, t), d in data.items() if d is not None}
         st.session_state["bt"] = (make_trades(data, cap * per / 100, strict), failed, counts, cap)
+        bar.empty()
 
     if "bt" not in st.session_state:
-        st.info(f"Run backtest nokku. Prathi coin ki, prathi TF ki {BT_CANDLES} candles tho separate backtest avutundi.")
+        st.info(f"Run backtest nokku. Prathi coin, prathi TF ki {BT_CANDLES} candles tho lekka avutundi.")
         return
     tr, failed, counts, cap = st.session_state["bt"]
     if failed:
@@ -374,36 +388,24 @@ def backtest_tab():
     tt["o"] = tt.TF.map({t: k for k, t in enumerate(TFS)})
     st.dataframe(tt.sort_values("o").drop(columns="o"), hide_index=True)
 
-    st.subheader("Prathi coin separate backtest")
-    st.caption("Coin nokku → aa coin ki anni TF lo trades: Entry/Exit time + price. Biggest loss = Loss #1 (red).")
-    for coin in COINS:
-        g = v[v.Coin == coin]
-        go = vo[(vo.Coin == coin) & (vo.Result == "OPEN")]
-        cn = ", ".join(f"{t}: {counts[(coin, t)]}" for t in TFS if (coin, t) in counts)
-        if g.empty:
-            head = f"{coin} — 0 closed trades"
-        else:
-            rw = (g["PnL ₹"] > 0).sum() / len(g) * 100
-            head = f"{coin} — {len(g)} trades • Real win {rw:.0f}% • Net ₹{g['PnL ₹'].sum():,.0f}"
-        with st.expander(head):
-            st.caption(f"Candles used → {cn if cn else 'data load avvaledu'}")
-            if g.empty and go.empty:
-                st.info("Ee coin ki ee filter lo trades levu.")
-                continue
-            if not g.empty:
-                k = st.columns(4)
-                k[0].metric("Trades", len(g))
-                k[1].metric("Win / Fail", f"{int((g.Result == 'SUCCESS').sum())} / {int((g.Result == 'FAIL').sum())}")
-                k[2].metric("Real Win %", f"{(g['PnL ₹'] > 0).sum() / len(g) * 100:.1f}%")
-                k[3].metric("Net PnL", f"₹{g['PnL ₹'].sum():,.0f}")
-                tbl = table(g, ["TF"])
-                tbl["o"] = tbl.TF.map({t: k2 for k2, t in enumerate(TFS)})
-                st.dataframe(tbl.sort_values("o").drop(columns="o"), hide_index=True)
-            d = pd.concat([g, go]).sort_values("_ts", ascending=False)
-            st.dataframe(d[TRADE_COLS].style.apply(hl, axis=1).format(FMT, na_rep=""),
-                         hide_index=True, height=min(520, 60 + 36 * len(d)))
-            if len(go):
-                st.caption(f"{len(go)} trade inka open (Exit = latest close, stats lo lekkaledu).")
+    st.subheader("Trades (time, price, entry, exit)")
+    cf = st.selectbox("Coin", ["All"] + COINS)
+    go = vo[vo.Result == "OPEN"]
+    d = pd.concat([v, go])
+    if cf != "All":
+        d = d[d.Coin == cf]
+    d = d.sort_values("_ts", ascending=False)
+    if d.empty:
+        st.info("Ee coin ki ee filter lo trades levu.")
+        return
+    cap_rows = 500
+    if len(d) > cap_rows:
+        st.caption(f"Latest {cap_rows} / {len(d)} trades chupistunnanu - Coin leda Timeframe filter vadandi.")
+        d = d.head(cap_rows)
+    cols = ["Loss #", "Coin"] + [c for c in TRADE_COLS if c != "Loss #"]
+    st.dataframe(d[cols].style.apply(hl, axis=1).format(FMT, na_rep=""),
+                 hide_index=True, height=520)
+    st.caption("Biggest loss = Loss #1 (red). Open trade ki Exit = latest close, stats lo lekkaledu.")
 
 
 def main():
